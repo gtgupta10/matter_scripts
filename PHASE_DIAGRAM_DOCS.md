@@ -1,766 +1,375 @@
-# Phase Diagram Workflow — Documentation
+# `phase.py` — End-to-End Ab-Initio Phase Diagram Workflow
 
-**Ab-initio surface phase diagram: QE + Phonopy + Flyte**  
-Generalized for arbitrary gas reservoirs, surface systems, and bulk references.
+## Overview
 
----
+`phase.py` is an automated, ab-initio pipeline for constructing surface phase diagrams of adsorbate–metal systems (e.g., O/Cu(111), H/Cu(111)). It orchestrates the full computational workflow from on-the-fly surface structure generation through DFT relaxation, phonon calculations, and multi-reservoir thermodynamic analysis — all scheduled via [Flyte](https://flyte.org/) for distributed, containerized execution.
 
-## Table of Contents
-
-1. [What the Code Does](#1-what-the-code-does)  
-2. [Physics Background](#2-physics-background)  
-3. [Workflow Stages](#3-workflow-stages)  
-4. [Data Classes Reference](#4-data-classes-reference)  
-   - 4.1 ConfigEntry  
-   - 4.2 GasData  
-   - 4.3 QEParams  
-   - 4.4 PhononParams  
-   - 4.5 PhaseDiagramParams  
-5. [configs.json Format](#5-configsjson-format)  
-6. [Outputs](#6-outputs)  
-7. [CLI Reference](#7-cli-reference)  
-8. [Example Systems](#8-example-systems)  
-   - 8.1 H/Pt(111) — hydrogen adsorption (JANAF, single reservoir)  
-   - 8.2 O/Cu(111) — oxygen adsorption (ideal-gas O₂)  
-   - 8.3 CO+O co-adsorption — two independent reservoirs  
-   - 8.4 N/Fe(110) — nitrogen adsorption + bulk nitride reference  
-   - 8.5 H₂O/Ru(0001) — water adsorption with two dependent reservoirs  
-9. [Chemical Potential Models](#9-chemical-potential-models)  
-10. [Supported Gas Species (JANAF)](#10-supported-gas-species-janaf)  
-11. [Normalisation Modes](#11-normalisation-modes)  
-12. [Flyte Remote Execution](#12-flyte-remote-execution)  
-13. [Known Limitations](#13-known-limitations)  
+The central scientific question answered is: **at a given temperature and gas-phase pressure, which surface coverage is thermodynamically most stable?**
 
 ---
 
-## 1. What the Code Does
+## Physics Background
 
-`phase_diagram_workflow.py` is a fully automated, end-to-end pipeline that takes
-crystal structure files (CIF, VASP POSCAR, or QE output) for a surface system and
-produces a thermodynamic surface phase diagram as a function of temperature and
-gas-phase pressure.
+### 1. Surface Slab Model
 
-**Key generalisations over the original code:**
+The metal surface is represented as a periodic **FCC(111) slab**:
+- A 2×2 supercell of the FCC(111) surface is built using ASE (`fcc111`)
+- Bottom layers are fixed to mimic bulk constraints (`FixAtoms`)
+- A vacuum layer (~12 Å default) separates periodic images along the surface normal
 
-| Feature | Original | Generalised |
-|---|---|---|
-| Gas reservoirs | H₂ only (hardcoded) | Any number; any gas species |
-| Chemical potential model | JANAF (H₂) only | `janaf` / `ideal_gas` / `phonopy` per species |
-| Stoichiometry tracking | Single `n_H` integer | Flexible `stoich` dict per config |
-| Pressure axes | One shared P axis | Per-reservoir P ranges |
-| Normalisation | Area only | Area / formula unit / none / auto |
-| Bulk references | Not supported | `bulk_ref` role supported |
-| Gas metadata | None | `GasData` with σ, 2S+1, linearity |
+Adsorbate coverages from 0 (clean) to 1 ML (monolayer) are generated at FCC hollow sites:
 
-The pipeline runs on [Flyte](https://flyte.org/) for distributed execution but
-also works locally via the CLI entry point.
+| Label        | Coverage | Adsorbates (out of 4 FCC sites) |
+|--------------|----------|--------------------------------|
+| `clean`      | 0 ML     | 0                              |
+| `0.25ML_fcc` | 0.25 ML  | 1                              |
+| `0.50ML_fcc` | 0.50 ML  | 2                              |
+| `0.75ML_fcc` | 0.75 ML  | 3                              |
+| `1.00ML_fcc` | 1.00 ML  | 4                              |
 
 ---
 
-## 2. Physics Background
+### 2. DFT Relaxation (Quantum ESPRESSO)
 
-For each surface configuration θ, the surface Gibbs free energy relative to the
-clean slab is:
+Each structure is geometrically relaxed using **Quantum ESPRESSO** (`pw.x`):
+- **Exchange-correlation**: GGA (PBE implied by pseudopotential choice) + **DFT-D3** van der Waals correction
+- **Basis set**: Plane waves with energy cutoffs `ecutwfc` (default 40 Ry) and `ecutrho` (default 320 Ry)
+- **k-point mesh**: 6×6×1 Monkhorst–Pack for slabs; Γ-only for gas-phase molecules
+- **Smearing**: Methfessel–Paxton (`mv`) with `degauss = 0.02 Ry` (metallic systems)
+- **Convergence thresholds**: Energy `1×10⁻⁸ Ry`, Force `1×10⁻⁴ Ry/Bohr`
 
-```
-ΔG(θ, T, {P_s}) = [ E_slab(θ) − E_clean − Σ_s n_s · μ_s(T, P_s)
-                     + ΔF_vib(θ, T) ]  /  A_norm
-```
-
-| Symbol | Meaning |
-|---|---|
-| `E_slab(θ)` | DFT total energy of slab with adsorbates (eV) |
-| `E_clean` | DFT total energy of the bare reference slab (eV) |
-| `n_s` | Net number of formula units of gas species `s` consumed |
-| `μ_s(T, P_s)` | Chemical potential of gas reservoir `s` (eV/molecule) |
-| `ΔF_vib(θ, T)` | `F_vib(slab+ads, T) − F_vib(clean, T)` from Phonopy (eV) |
-| `A_norm` | Normalisation: cell area (Å²), formula units, or 1 |
-
-The **stable phase** at each (T, P) point is the configuration with the lowest ΔG.
-
-### Chemical potential models
-
-Three models are available per gas reservoir (set via `gas_data.mu_model`):
-
-#### `janaf` (default)
-```
-μ(T, P) = E_DFT + ZPE + Δμ°(T) + k_B T · ln(P / P°)
-```
-`Δμ°(T)` is read from built-in NIST-JANAF tables.  
-ZPE is taken from the literature (see [Section 10](#10-supported-gas-species-janaf)).
-
-#### `ideal_gas`
-Full statistical-mechanical partition function computed from the QE-relaxed
-geometry and Phonopy vibrational frequencies:
-
-```
-μ(T, P) = E_DFT + ZPE + F_vib_thermal(T)
-         − k_B T [ ln(q_trans/V) + ln(q_rot) + ln(g_e) ]
-         + k_B T · ln(P / P°)
-```
-
-| Partition function | Formula | Inputs needed |
-|---|---|---|
-| Translational `q_trans/V` | `(2πmkT/h²)^(3/2)` | Molecular mass from ASE |
-| Rotational (linear) `q_rot` | `T / (σ · Θ_rot)` | Moment of inertia from geometry |
-| Rotational (nonlinear) `q_rot` | `√π/σ · (T³/Θ_AΘ_BΘ_C)^(1/2)` | Three principal moments |
-| Vibrational `q_vib` | `∏ exp(−ħω_i/2kT) / (1−exp(−ħω_i/kT))` | Phonopy frequencies |
-| Electronic `g_e` | `2S+1` | `spin_multiplicity` in GasData |
-
-#### `phonopy`
-```
-μ(T, P) = E_DFT + F_vib(T) + k_B T · ln(P / P°)
-```
-Uses the harmonic vibrational free energy from Phonopy, no tabulated data.
+The total DFT energy E_DFT is extracted from the `!  total energy` line in the `pw.x` output (in Ry, converted to eV).
 
 ---
 
-## 3. Workflow Stages
+### 3. Phonon Calculations (Phonopy + finite differences)
+
+Vibrational (phonon) contributions are computed via the **finite displacement method** using [Phonopy](https://phonopy.github.io/phonopy/):
+
+1. The relaxed structure is displaced atom-by-atom by a small distance (default 0.03 Å)
+2. Single-point SCF calculations are run for each displaced supercell
+3. Forces are parsed from `pw.x` outputs (converted from Ry/Bohr to eV/Å × 25.711)
+4. Force constants are assembled; phonon frequencies are obtained at the Γ-point (gas) or a full k-mesh (slabs)
+
+The vibrational **Helmholtz free energy** at temperature T is:
 
 ```
-configs.json
-    │
-    ├─ For each slab/clean config ──────────────────────────────────┐
-    │   structure_prep_task  →  relax_task  →  phonopy_displacements_task
-    │                                          │
-    │                                    map_task: run_displacement_task (×N, parallel)
-    │                                          │
-    │                                    phonopy_free_energy_task  → F_vib(T)
-    │                                                                           │
-    ├─ For each gas_ref (JANAF) ───────────────────────────────────┐           │
-    │   structure_prep_task  →  relax_task  →  gas_reference_task  ─────────────┤
-    │                                                                           │
-    ├─ For each gas_ref (ideal_gas/phonopy) ─── same as slab pipeline ──────────┤
-    │                                                                           │
-    └──────────────────────────────────────────────────────────────────────────▼
-                                                      phase_diagram_task
-                                                      ΔG(T,P) → CSV/JSON/PNG/TXT
+F_vib(T) = ZPE + kT Σ_ν ln(1 - exp(-hν/kT))
 ```
 
-| Task | Description | Resources |
-|---|---|---|
-| `structure_prep_task` | Load CIF/VASP, detect cell area and n_fu, write pw.x input | Light |
-| `relax_task` | Run `pw.x` relax or SCF, parse energy, save POSCAR | Heavy |
-| `phonopy_displacements_task` | Generate displaced supercells, write SCF inputs | Light |
-| `run_displacement_task` | Run single-point SCF for one displaced supercell | Heavy |
-| `phonopy_free_energy_task` | Assemble FORCE_SETS, run phonopy DOS, produce F_vib(T) | Medium |
-| `gas_reference_task` | Build μ(T,P) grid from JANAF/ideal_gas/phonopy model | Light |
-| `phase_diagram_task` | Compute ΔG, write all outputs | Light |
+where ν are the phonon frequencies. Frequencies below 50 cm⁻¹ are excluded (acoustic/spurious modes).
+
+For gas molecules, the **ideal-gas chemical potential** is computed from statistical mechanics:
+
+```
+μ(T, P) = E_DFT + ZPE + F_vib,therm - kT ln(q_trans · q_rot · g_spin)
+```
+
+where:
+- `q_trans = (2πmkT/h²)^(3/2) · V` — translational partition function (V = kT/P)
+- `q_rot` — rotational partition function (linear or non-linear molecule)
+- `g_spin = 2S+1` — spin degeneracy (e.g., 3 for O₂)
+- `σ` — molecular symmetry number (e.g., 2 for H₂, O₂, N₂; 1 for CO)
 
 ---
 
-## 4. Data Classes Reference
+### 4. Multi-Reservoir Thermodynamics (Phase Diagram Assembly)
 
-### 4.1 ConfigEntry
+The surface Gibbs free energy of adsorption relative to the clean slab is:
 
-One entry in `configs.json`.
+```
+ΔG(T, P) = [E_slab(θ) - E_clean + F_vib,slab(T) - F_vib,clean(T)] - N_ads · μ_ads(T, P)
+```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `label` | str | ✓ | Unique identifier (used in all output filenames and labels) |
-| `role` | str | ✓ | `"clean"` / `"slab"` / `"gas_ref"` / `"bulk_ref"` |
-| `geometry` | str | ✓ | `"slab"` / `"bulk"` / `"gas"` |
-| `structure` | str | ✓ | Path to CIF, VASP POSCAR, or QE output |
-| `stoich` | dict | — | Gas consumed to form this config from the clean surface. Key = gas_ref label, value = float. Positive = consumed from gas phase. Default `{}`. |
-| `gas_data` | GasData | — | Only for `role="gas_ref"`. Controls chemical potential model. |
-| `n_fu` | int | — | Number of formula units in bulk cell (only for `bulk_ref`). 0 = auto-detect. |
+where:
+- `E_slab(θ)` — DFT energy of slab at coverage θ
+- `N_ads` — number of adsorbate atoms in the supercell
+- `μ_ads(T, P)` — chemical potential of the adsorbate element, derived from the gas-phase molecule (e.g., μ_O = μ(O₂)/2)
 
-**Role semantics:**
-
-| Role | Enters Phase Diagram | Used As |
-|---|---|---|
-| `clean` | Yes (as reference, ΔG = 0 by definition) | `E_clean` in ΔG formula |
-| `slab` | Yes | Surface configuration at some coverage |
-| `gas_ref` | No | Chemical potential reservoir |
-| `bulk_ref` | No (currently) | Energy reference for oxide/nitride stability |
-
-### 4.2 GasData
-
-Gas-molecule metadata (nested inside ConfigEntry for `role="gas_ref"`).
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `molecule` | str | `""` | Species name, e.g. `"H2"`, `"O2"`, `"H2O"`. Used to look up JANAF table. Falls back to `label` if empty. |
-| `symmetry_number` | int | 1 | Rotational symmetry number σ. H₂=2, N₂=2, O₂=2, H₂O=2, NH₃=3, CO=1. |
-| `spin_multiplicity` | int | 1 | Electronic degeneracy 2S+1. O₂=3, NO=2, all others=1. |
-| `linear` | bool | True | True for linear molecules (H₂, N₂, O₂, CO, NO, CO₂). |
-| `mu_model` | str | `"janaf"` | `"janaf"` / `"ideal_gas"` / `"phonopy"` |
-| `stoich_factor` | float | 1.0 | Scaling factor applied to μ. Use 0.5 to get per-atom chemical potential from a diatomic. |
-
-### 4.3 QEParams
-
-Quantum ESPRESSO pw.x settings shared across all calculations.
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `pseudo_dir` | str | `"/pseudos"` | Directory containing `.UPF` pseudopotential files |
-| `ecutwfc` | float | 60.0 | Plane-wave cutoff (Ry) |
-| `ecutrho` | float | 480.0 | Density cutoff (Ry). Typically 4× ecutwfc for NC, 8× for USPP |
-| `kpoints` | str | `"6 6 1 0 0 0"` | k-point mesh for slab/bulk as `"nx ny nz sx sy sz"` |
-| `kpoints_gas` | str | `"1 1 1 0 0 0"` | k-point mesh for gas/molecule calculations |
-| `smearing` | str | `"mv"` | Smearing type: `mv` (Marzari-Vanderbilt), `mp`, `fd`, `gs` |
-| `degauss` | float | 0.02 | Smearing width (Ry) |
-| `conv_thr` | float | 1e-8 | SCF convergence threshold (Ry) |
-| `forc_conv_thr` | float | 1e-4 | Force convergence for relax (Ry/Bohr) |
-| `mixing_beta` | float | 0.3 | Charge density mixing |
-| `vdw_corr` | str | `"dft-d3"` | Van der Waals correction. `""` to disable. |
-| `nstep` | int | 200 | Max ionic steps in relax |
-| `mpi_procs` | int | `os.cpu_count()` | MPI processes per pw.x run |
-| `pw_exe` | str | `"pw.x"` | pw.x executable |
-| `fix_bottom` | bool | True | Fix bottom half of slab atoms during relaxation |
-
-### 4.4 PhononParams
-
-Phonopy displacement and k-mesh settings.
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `supercell_matrix` | str | `"2 2 1"` | Diagonal expansion as `"nx ny nz"`, or full 3×3 as 9 ints |
-| `displacement_dist` | float | 0.03 | Atomic displacement distance (Å) |
-| `mesh` | str | `"20 20 1"` | q-point sampling mesh for phonon DOS |
-| `is_symmetry` | bool | True | Exploit crystal symmetry to reduce number of displacements |
-| `sc_kpoints` | str | `"2 2 1 0 0 0"` | k-mesh for displaced supercell SCF runs. Usually coarser than the slab mesh. |
-
-### 4.5 PhaseDiagramParams
-
-Temperature/pressure grid and output options.
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `temperatures_K` | str | `"100,...,900"` | Comma-separated temperature list in Kelvin |
-| `logP_min` | float | -15.0 | Global minimum log₁₀(P/Pa) |
-| `logP_max` | float | 5.0 | Global maximum log₁₀(P/Pa) |
-| `logP_step` | float | 0.25 | Step size for the pressure grid |
-| `logP_species` | str | `""` | Per-reservoir overrides: `"O2:-20:5,H2:-15:0"` |
-| `normalization` | str | `"auto"` | `"area"` / `"formula_unit"` / `"none"` / `"auto"` |
-| `reference_label` | str | `""` | Label of clean config (auto-detected as the unique `role="clean"` entry) |
-| `subtract_clean_vib` | bool | True | Subtract F_vib of clean slab from ΔF_vib |
-| `output_prefix` | str | `"phase_diagram"` | Prefix for all output files |
+`ΔG` is normalized per unit cell area (Å²) when `normalization = "area"` (default). The phase with the **most negative ΔG** at each (T, P) point is the thermodynamically stable phase.
 
 ---
 
-## 5. configs.json Format
+## Code Architecture
 
-The JSON array must contain exactly **one** entry with `"role": "clean"`, at least
-**one** `"role": "slab"`, and at least **one** `"role": "gas_ref"`.
-
-Every `stoich` key in a slab config must match the `label` of a `gas_ref` entry.
-
-**Minimal example (one species, two coverages):**
-
-```json
-[
-  {
-    "label": "clean",
-    "role": "clean",
-    "geometry": "slab",
-    "structure": "clean.cif",
-    "stoich": {}
-  },
-  {
-    "label": "0.25ML",
-    "role": "slab",
-    "geometry": "slab",
-    "structure": "0.25ML.cif",
-    "stoich": {"H2": 1}
-  },
-  {
-    "label": "H2",
-    "role": "gas_ref",
-    "geometry": "gas",
-    "structure": "h2.cif",
-    "stoich": {},
-    "gas_data": {
-      "molecule": "H2",
-      "symmetry_number": 2,
-      "spin_multiplicity": 1,
-      "linear": true,
-      "mu_model": "janaf",
-      "stoich_factor": 0.5
-    }
-  }
-]
+```
+phase.py
+├── Constants & Lattice Parameters
+├── Dataclasses (config, parameters, I/O structs)
+├── Pure Helpers
+│   ├── _make_clean_slab()            — ASE slab builder
+│   ├── _add_adsorbate_coverage()     — FCC site adsorbate placement
+│   ├── _ideal_gas_mu()               — statistical-mechanics chemical potential
+│   ├── _parse_pw_energy()            — parse QE total energy
+│   └── _parse_pw_forces()            — parse QE atomic forces
+├── Flyte Tasks (6 stages)
+│   ├── Task 0: generate_structures_task
+│   ├── Task 1: structure_prep_task
+│   ├── Task 2: relax_task
+│   ├── Task 3: phonopy_displacements_task
+│   ├── Task 4: run_displacement_task
+│   ├── Task 5: phonopy_free_energy_task
+│   └── Task 6: phase_diagram_task
+├── Dynamic Workflow: run_phase_diagram_dynamic
+└── Main Workflow: integrated_phase_diagram_workflow
 ```
 
-> **`stoich_factor: 0.5` on H₂** means the stored μ represents per-H atom chemical
-> potential, so `"stoich": {"H2": 1}` means one adsorbed H atom (not one H₂).
-> Alternatively keep `stoich_factor: 1.0` and use `"stoich": {"H2": 0.5}`.
-> Both conventions give identical results. The first is more natural when thinking
-> in terms of adsorbate counts.
+### Key Dataclasses
 
-**Multi-reservoir example (CO + O₂):**
+| Dataclass             | Purpose                                                        |
+|-----------------------|----------------------------------------------------------------|
+| `QEParams`            | All Quantum ESPRESSO input parameters                         |
+| `PhononParams`        | Phonopy supercell, displacement, and mesh settings            |
+| `PhaseDiagramParams`  | Temperature grid, pressure range, normalization, output prefix|
+| `ConfigEntry`         | Per-structure metadata (label, role, stoichiometry, gas data) |
+| `RelaxOutput`         | DFT energy, relaxed geometry, mass, moments of inertia        |
+| `PhononOutput`        | Force sets, vibrational free energies, ZPE, frequencies       |
+| `PhaseDiagramOutput`  | CSV/JSON/TXT results, optional PNG plot                       |
 
-```json
-[
-  {
-    "label": "clean",
-    "role": "clean",
-    "geometry": "slab",
-    "structure": "clean.cif",
-    "stoich": {}
-  },
-  {
-    "label": "0.25ML_CO",
-    "role": "slab",
-    "geometry": "slab",
-    "structure": "0.25ML_CO.cif",
-    "stoich": {"CO": 1}
-  },
-  {
-    "label": "0.25ML_O",
-    "role": "slab",
-    "geometry": "slab",
-    "structure": "0.25ML_O.cif",
-    "stoich": {"O2": 0.5}
-  },
-  {
-    "label": "0.25ML_CO+O",
-    "role": "slab",
-    "geometry": "slab",
-    "structure": "0.25ML_CO+O.cif",
-    "stoich": {"CO": 1, "O2": 0.5}
-  },
-  {
-    "label": "CO",
-    "role": "gas_ref",
-    "geometry": "gas",
-    "structure": "co.cif",
-    "stoich": {},
-    "gas_data": {"molecule": "CO", "mu_model": "janaf"}
-  },
-  {
-    "label": "O2",
-    "role": "gas_ref",
-    "geometry": "gas",
-    "structure": "o2.cif",
-    "stoich": {},
-    "gas_data": {
-      "molecule": "O2",
-      "symmetry_number": 2,
-      "spin_multiplicity": 3,
-      "linear": true,
-      "mu_model": "ideal_gas"
-    }
-  }
-]
+---
+
+## Inputs
+
+### CLI Arguments (direct script execution)
+
+| Argument        | Type    | Default                    | Description                                      |
+|-----------------|---------|----------------------------|--------------------------------------------------|
+| `--metal`       | str     | `Cu`                       | FCC metal symbol (Cu, Ni, Pd, Ag, Au, Al)        |
+| `--layers`      | int     | `3`                        | Number of atomic layers in the slab              |
+| `--vacuum`      | float   | `12.0`                     | Vacuum thickness above slab (Å)                  |
+| `--adsorbate`   | str     | `H`                        | Atomic symbol for the adsorbate (O, H, N, C, …)  |
+| `--gas`         | str     | `H2`                       | Gas molecule acting as adsorbate reservoir        |
+| `--temperatures`| str     | `"200,300,400,500,600"`    | Comma-separated list of temperatures (K)         |
+| `--pseudo-dir`  | str     | `"./pseudos"`              | Directory containing pseudopotential files       |
+| `--mpi-procs`   | int     | `8`                        | Number of MPI processes for `pw.x`               |
+
+### Workflow Parameters (Flyte / Python API)
+
+Additional parameters are passed via dataclasses when calling `integrated_phase_diagram_workflow()`:
+
+**`QEParams`**
+| Field            | Default     | Description                              |
+|------------------|-------------|------------------------------------------|
+| `pseudo_dir`     | `./pseudos` | Pseudopotential directory                |
+| `ecutwfc`        | `40.0`      | Wavefunction cutoff (Ry)                 |
+| `ecutrho`        | `320.0`     | Charge density cutoff (Ry)               |
+| `kpoints`        | `6 6 1 0 0 0` | Monkhorst–Pack grid for slabs          |
+| `smearing`       | `mv`        | Smearing type (Methfessel–Paxton)        |
+| `degauss`        | `0.02`      | Smearing width (Ry)                      |
+| `conv_thr`       | `1e-8`      | SCF energy convergence (Ry)              |
+| `forc_conv_thr`  | `1e-4`      | Force convergence threshold (Ry/Bohr)    |
+| `mixing_beta`    | `0.3`       | Charge mixing parameter                  |
+| `vdw_corr`       | `dft-d3`    | Van der Waals correction scheme          |
+| `nstep`          | `200`       | Maximum ionic steps                      |
+| `mpi_procs`      | `4`         | MPI processes per task                   |
+| `pw_exe`         | `pw.x`      | Path/name of the QE executable           |
+
+**`PhononParams`**
+| Field               | Default    | Description                                      |
+|---------------------|------------|--------------------------------------------------|
+| `supercell_matrix`  | `2 2 1`    | Phonopy supercell expansion                      |
+| `displacement_dist` | `0.03`     | Atomic displacement distance (Å)                 |
+| `mesh`              | `20 20 1`  | q-point mesh for slab thermal properties         |
+| `is_symmetry`       | `True`     | Use symmetry to reduce displacements             |
+
+**`PhaseDiagramParams`**
+| Field            | Default                         | Description                                          |
+|------------------|---------------------------------|------------------------------------------------------|
+| `temperatures_K` | `200,300,...,900`               | Temperature grid (K), comma-separated                |
+| `logP_species`   | `""`                            | Species for pressure axis (reserved for future use)  |
+| `logP_min/max`   | `-15.0` / `5.0`                 | log₁₀ pressure range (Pa)                           |
+| `logP_step`      | `0.25`                          | log₁₀ pressure step                                 |
+| `normalization`  | `area`                          | Normalize ΔG by: `area` (Å²) or `adsorbate`        |
+| `output_prefix`  | `phase_diagram`                 | Prefix for output file names                         |
+
+---
+
+## Outputs
+
+| File / Field             | Format   | Description                                                |
+|--------------------------|----------|------------------------------------------------------------|
+| `results_csv`            | CSV      | ΔG(T) for all phases; columns: `T_K`, one per phase label |
+| `results_json`           | JSON     | Same data as CSV (currently same file path)               |
+| `summary_txt`            | TXT      | One-line summary of phases and references found            |
+| `plot_png`               | PNG      | Phase diagram plot (currently `None`, placeholder)        |
+| `summary`                | str      | Printed to stdout when run as `__main__`                  |
+
+### CSV Output Example
+
+```
+T_K,clean,0.25ML_fcc,0.50ML_fcc,0.75ML_fcc,1.00ML_fcc
+200,-0.0000,-0.0312,-0.0418,-0.0395,-0.0271
+300,-0.0000,-0.0289,-0.0376,-0.0341,-0.0198
+...
 ```
 
 ---
 
-## 6. Outputs
+## Example CLI Invocations
 
-All output files are written to the directory where the workflow runs (local) or
-to Flyte's object store (remote). Each file is named `{output_prefix}_*`.
+### Oxygen on Copper(111) at multiple temperatures
 
-| File | Format | Description |
-|---|---|---|
-| `{prefix}_free_energies.csv` | CSV | ΔG for all configs at every (T, P) grid point, plus `stable_phase` column |
-| `{prefix}_phase_diagram.json` | JSON | Full grid data including metadata, T array, P array per reservoir, ΔG arrays, stable-phase map |
-| `{prefix}_phase_diagram.png` | PNG | 2D phase diagram plot (T vs first P axis), inset ΔG-vs-T curves |
-| `{prefix}_summary.txt` | TXT | Human-readable summary: config energies, ZPEs, stable phases at key (T,P) points |
+```bash
+python phase.py \
+  --metal Cu \
+  --adsorbate O \
+  --gas O2 \
+  --layers 4 \
+  --vacuum 15.0 \
+  --temperatures "300,400,500,600,700,800" \
+  --pseudo-dir ./pseudos \
+  --mpi-procs 8
+```
 
-### CSV columns
+### Hydrogen on Nickel(111), quick test (3 temperatures)
 
-| Column | Description |
-|---|---|
-| `T_K` | Temperature (K) |
-| `log10_P_{species}_Pa` | log₁₀(P/Pa) for each reservoir |
-| `G_{label}_eV_norm` | ΔG in the normalised units (eV/Å², eV/fu, or eV/cell) |
-| `stable_phase` | Label of the most stable config at this (T, P) |
+```bash
+python phase.py \
+  --metal Ni \
+  --adsorbate H \
+  --gas H2 \
+  --layers 3 \
+  --temperatures "300,500,700" \
+  --pseudo-dir ./pseudos \
+  --mpi-procs 4
+```
 
-### JSON structure
+### Nitrogen on Palladium(111)
+
+```bash
+python phase.py \
+  --metal Pd \
+  --adsorbate N \
+  --gas N2 \
+  --layers 4 \
+  --temperatures "400,600,800,1000" \
+  --pseudo-dir ./pseudos \
+  --mpi-procs 16
+```
+
+### Default run (H/Cu, all defaults)
+
+```bash
+python phase.py
+```
+
+---
+
+## Example JSON Inputs (Flyte / Python API)
+
+When calling the workflow programmatically or via a Flyte launch form, parameters are structured as JSON:
+
+### Minimal (O/Cu, defaults elsewhere)
 
 ```json
 {
-  "meta": {
-    "cell_area_ang2": 12.345,
+  "metal": "Cu",
+  "adsorbate": "O",
+  "gas": "O2",
+  "layers": 3,
+  "vacuum": 12.0,
+  "qe_params": {
+    "pseudo_dir": "./pseudos",
+    "ecutwfc": 40.0,
+    "ecutrho": 320.0,
+    "mpi_procs": 8
+  },
+  "pd_params": {
+    "temperatures_K": "300,400,500,600,700"
+  }
+}
+```
+
+### High-accuracy run (CO/Pd, tighter convergence, more layers)
+
+```json
+{
+  "metal": "Pd",
+  "adsorbate": "C",
+  "gas": "CO",
+  "layers": 5,
+  "vacuum": 15.0,
+  "qe_params": {
+    "pseudo_dir": "/shared/pseudos",
+    "ecutwfc": 60.0,
+    "ecutrho": 480.0,
+    "kpoints": "8 8 1 0 0 0",
+    "conv_thr": 1e-10,
+    "forc_conv_thr": 1e-5,
+    "mpi_procs": 32
+  },
+  "ph_params": {
+    "supercell_matrix": "3 3 1",
+    "displacement_dist": 0.02,
+    "mesh": "30 30 1"
+  },
+  "pd_params": {
+    "temperatures_K": "200,300,400,500,600,700,800,900,1000",
     "normalization": "area",
-    "stoich": {"clean": {}, "0.25ML": {"H2": 1}},
-    "gas_refs": ["H2"]
+    "output_prefix": "CO_Pd111"
+  }
+}
+```
+
+### Hydrogen/Nickel quick test (minimal phonon cost)
+
+```json
+{
+  "metal": "Ni",
+  "adsorbate": "H",
+  "gas": "H2",
+  "layers": 3,
+  "vacuum": 12.0,
+  "qe_params": {
+    "pseudo_dir": "./pseudos",
+    "mpi_procs": 4
   },
-  "T_K": [200, 300, ...],
-  "logP_Pa": {"H2": [-15.0, -14.75, ...]},
-  "configs": {
-    "clean":  [[ΔG at T0P0, ΔG at T0P1, ...], ...],
-    "0.25ML": [[...], ...]
+  "ph_params": {
+    "supercell_matrix": "2 2 1",
+    "mesh": "10 10 1"
   },
-  "stable_phase": [["clean", "0.25ML", ...], ...]
+  "pd_params": {
+    "temperatures_K": "300,600,900"
+  }
 }
 ```
 
 ---
 
-## 7. CLI Reference
+## Dependencies
 
-```
-python phase_diagram_workflow.py --configs <file.json> [options]
-```
-
-### Required
-
-| Argument | Description |
-|---|---|
-| `--configs` | Path to configs.json |
-
-### QE parameters
-
-| Argument | Default | Description |
-|---|---|---|
-| `--pseudo-dir` | `/pseudos` | Pseudopotential directory |
-| `--ecutwfc` | 60.0 | Plane-wave cutoff (Ry) |
-| `--ecutrho` | 480.0 | Density cutoff (Ry) |
-| `--kpoints` | `"6 6 1 0 0 0"` | k-mesh for slab calculations |
-| `--kpoints-gas` | `"1 1 1 0 0 0"` | k-mesh for gas molecule SCF |
-| `--vdw-corr` | `dft-d3` | VdW correction (`""` to disable) |
-| `--mpi-procs` | 16 | MPI processes per pw.x run |
-| `--pw-exe` | `pw.x` | pw.x executable |
-| `--no-fix-bottom` | — | Disable fixing bottom-half slab atoms |
-
-### Phonopy parameters
-
-| Argument | Default | Description |
-|---|---|---|
-| `--supercell` | `"2 2 1"` | Supercell expansion |
-| `--displacement` | 0.03 | Displacement distance (Å) |
-| `--mesh` | `"20 20 1"` | Phonon DOS q-mesh |
-| `--sc-kpoints` | `"2 2 1 0 0 0"` | k-mesh for supercell SCF runs |
-
-### Phase diagram parameters
-
-| Argument | Default | Description |
-|---|---|---|
-| `--temperatures` | `"100,...,900"` | Comma-separated temperatures (K) |
-| `--pmin` | -15.0 | Global log₁₀(P/Pa) minimum |
-| `--pmax` | 5.0 | Global log₁₀(P/Pa) maximum |
-| `--pstep` | 0.25 | log₁₀(P) step size |
-| `--logp-species` | `""` | Per-species P range: `"O2:-20:5,H2:-15:0"` |
-| `--normalization` | `auto` | `area` / `formula_unit` / `none` / `auto` |
-| `--no-clean-vib` | — | Do not subtract F_vib(clean) from ΔG |
-| `--prefix` | `phase_diagram` | Output file prefix |
+| Package            | Role                                              |
+|--------------------|---------------------------------------------------|
+| `numpy`            | Numerical operations, array math                  |
+| `ase`              | Atomic Simulation Environment — structure building, I/O |
+| `phonopy`          | Finite-displacement phonon calculations           |
+| `flytekit`         | Workflow orchestration (tasks, dynamic, map_task) |
+| `Quantum ESPRESSO` | External DFT engine (`pw.x`)                     |
+| Docker image       | `guptag13/slab:v5` — contains all the above       |
 
 ---
 
-## 8. Example Systems
+## Physical Constants Used
 
-### 8.1 H/Pt(111) — hydrogen adsorption (JANAF, single reservoir)
-
-**configs_H_Pt111.json:**
-```json
-[
-  {"label": "clean",      "role": "clean",   "geometry": "slab",
-   "structure": "Pt111_clean.cif",    "stoich": {}},
-  {"label": "0.11ML_fcc", "role": "slab",    "geometry": "slab",
-   "structure": "Pt111_0.11ML.cif",   "stoich": {"H2": 0.5}},
-  {"label": "0.25ML_fcc", "role": "slab",    "geometry": "slab",
-   "structure": "Pt111_0.25ML.cif",   "stoich": {"H2": 1}},
-  {"label": "0.50ML",     "role": "slab",    "geometry": "slab",
-   "structure": "Pt111_0.50ML.cif",   "stoich": {"H2": 2}},
-  {"label": "1ML",        "role": "slab",    "geometry": "slab",
-   "structure": "Pt111_1ML.cif",      "stoich": {"H2": 4}},
-  {"label": "H2",         "role": "gas_ref", "geometry": "gas",
-   "structure": "h2.cif",             "stoich": {},
-   "gas_data": {"molecule": "H2", "mu_model": "janaf"}}
-]
-```
-
-**CLI:**
-```bash
-python phase_diagram_workflow.py \
-    --configs configs_H_Pt111.json \
-    --pseudo-dir /pseudos \
-    --temperatures "200,300,400,500,600,700,800,900" \
-    --pmin -15 --pmax 5 \
-    --prefix H_Pt111
-```
-
-**Expected output**: phase diagram showing clean → 0.25ML → higher coverages
-as T decreases or P(H₂) increases.
+| Symbol         | Value                   | Meaning                          |
+|----------------|-------------------------|----------------------------------|
+| `_RY_TO_EV`    | 13.6057 eV/Ry           | Rydberg → eV conversion          |
+| `_EV_TO_J`     | 1.6022×10⁻¹⁹ J/eV      | eV → Joules                      |
+| `_KB_EV`       | 8.6173×10⁻⁵ eV/K        | Boltzmann constant (eV)          |
+| `_KB_J`        | 1.3806×10⁻²³ J/K        | Boltzmann constant (J)           |
+| `_H_J`         | 6.6261×10⁻³⁴ J·s        | Planck constant                  |
+| `_AMU_TO_KG`   | 1.6605×10⁻²⁷ kg/amu     | Atomic mass unit → kg            |
+| `_P0_PA`       | 101325 Pa               | Standard pressure (1 atm)        |
+| `_CM1_TO_EV`   | 1.2398×10⁻⁴ eV/cm⁻¹    | Wavenumber → eV                  |
+| `_C_CM_S`      | 2.9979×10¹⁰ cm/s        | Speed of light                   |
 
 ---
 
-### 8.2 O/Cu(111) — oxygen adsorption (ideal-gas O₂)
+## Notes & Limitations
 
-**configs_O_Cu111.json:**
-```json
-[
-  {"label": "clean",    "role": "clean",   "geometry": "slab",
-   "structure": "Cu111_clean.cif", "stoich": {}},
-  {"label": "0.25ML_O","role": "slab",    "geometry": "slab",
-   "structure": "Cu111_0.25O.cif", "stoich": {"O2": 0.5}},
-  {"label": "0.50ML_O","role": "slab",    "geometry": "slab",
-   "structure": "Cu111_0.50O.cif", "stoich": {"O2": 1.0}},
-  {"label": "1ML_O",   "role": "slab",    "geometry": "slab",
-   "structure": "Cu111_1ML_O.cif", "stoich": {"O2": 2.0}},
-  {"label": "O2",      "role": "gas_ref", "geometry": "gas",
-   "structure": "o2.cif",          "stoich": {},
-   "gas_data": {
-     "molecule": "O2",
-     "symmetry_number": 2,
-     "spin_multiplicity": 3,
-     "linear": true,
-     "mu_model": "ideal_gas"
-   }}
-]
-```
-
-**CLI:**
-```bash
-python phase_diagram_workflow.py \
-    --configs configs_O_Cu111.json \
-    --pseudo-dir /pseudos \
-    --temperatures "300,500,700,900,1100" \
-    --pmin -20 --pmax 5 \
-    --prefix O_Cu111
-```
-
-> **Note:** `ideal_gas` requires a phonopy run for O₂. This adds one set of
-> displacement calculations for the O₂ molecule. For a diatomic, phonopy will
-> produce only one non-trivial frequency (the O-O stretch), which feeds into
-> q_vib and ZPE.
-
----
-
-### 8.3 CO+O co-adsorption — two independent reservoirs
-
-Each reservoir (CO and O₂) has its own independent pressure axis. The output
-CSV will have two P columns; the JSON and PNG use the first reservoir's P axis
-with the second at its midpoint for 2D visualisation.
-
-**configs_CO_O_Pd111.json:**
-```json
-[
-  {"label": "clean",      "role": "clean",   "geometry": "slab",
-   "structure": "Pd111_clean.cif",    "stoich": {}},
-  {"label": "0.25ML_CO",  "role": "slab",    "geometry": "slab",
-   "structure": "Pd111_0.25CO.cif",   "stoich": {"CO": 1}},
-  {"label": "0.25ML_O",   "role": "slab",    "geometry": "slab",
-   "structure": "Pd111_0.25O.cif",    "stoich": {"O2": 0.5}},
-  {"label": "0.25CO+0.25O","role": "slab",   "geometry": "slab",
-   "structure": "Pd111_CO_O.cif",     "stoich": {"CO": 1, "O2": 0.5}},
-  {"label": "CO",         "role": "gas_ref", "geometry": "gas",
-   "structure": "co.cif",             "stoich": {},
-   "gas_data": {"molecule": "CO",  "mu_model": "janaf"}},
-  {"label": "O2",         "role": "gas_ref", "geometry": "gas",
-   "structure": "o2.cif",             "stoich": {},
-   "gas_data": {"molecule": "O2",  "mu_model": "janaf",
-                "spin_multiplicity": 3}}
-]
-```
-
-**CLI:**
-```bash
-python phase_diagram_workflow.py \
-    --configs configs_CO_O_Pd111.json \
-    --pseudo-dir /pseudos \
-    --temperatures "300,400,500,600,700,800" \
-    --logp-species "CO:-20:5,O2:-20:5" \
-    --prefix CO_O_Pd111
-```
-
----
-
-### 8.4 N/Fe(110) — nitrogen adsorption + bulk nitride reference
-
-A bulk iron nitride (`Fe₄N`) is included as a `bulk_ref`. Its energy (per
-formula unit, auto-detected from the supercell) can be referenced in stoich to
-model bulk phase competition. Note: `bulk_ref` entries do not enter the phase
-diagram directly in this version but are stored in outputs for post-processing.
-
-**configs_N_Fe110.json:**
-```json
-[
-  {"label": "clean",      "role": "clean",    "geometry": "slab",
-   "structure": "Fe110_clean.cif",   "stoich": {}},
-  {"label": "0.25ML_N",   "role": "slab",     "geometry": "slab",
-   "structure": "Fe110_0.25N.cif",   "stoich": {"N2": 0.5}},
-  {"label": "0.50ML_N",   "role": "slab",     "geometry": "slab",
-   "structure": "Fe110_0.50N.cif",   "stoich": {"N2": 1.0}},
-  {"label": "N2",         "role": "gas_ref",  "geometry": "gas",
-   "structure": "n2.cif",            "stoich": {},
-   "gas_data": {"molecule": "N2", "mu_model": "janaf"}},
-  {"label": "Fe4N",       "role": "bulk_ref", "geometry": "bulk",
-   "structure": "fe4n.cif",          "stoich": {}, "n_fu": 1}
-]
-```
-
-**CLI:**
-```bash
-python phase_diagram_workflow.py \
-    --configs configs_N_Fe110.json \
-    --pseudo-dir /pseudos \
-    --temperatures "400,500,600,700,800,900,1000" \
-    --pmin -20 --pmax 5 \
-    --prefix N_Fe110
-```
-
----
-
-### 8.5 H₂O/Ru(0001) — water adsorption with two dependent reservoirs
-
-H₂O, H₂, and O₂ are linked by the reaction H₂O ⇌ H₂ + ½O₂. By including both
-H₂ and H₂O as separate gas_ref entries, you can express adsorbate stoichiometry
-in terms of either (or both) reservoirs.
-
-**configs_H2O_Ru0001.json:**
-```json
-[
-  {"label": "clean",      "role": "clean",   "geometry": "slab",
-   "structure": "Ru0001_clean.cif",  "stoich": {}},
-  {"label": "H2O_ads",    "role": "slab",    "geometry": "slab",
-   "structure": "Ru0001_H2O.cif",    "stoich": {"H2O": 1}},
-  {"label": "OH_ads",     "role": "slab",    "geometry": "slab",
-   "structure": "Ru0001_OH.cif",     "stoich": {"H2O": 1, "H2": -0.5}},
-  {"label": "O_ads",      "role": "slab",    "geometry": "slab",
-   "structure": "Ru0001_O.cif",      "stoich": {"H2O": 1, "H2": -1}},
-  {"label": "H2O",        "role": "gas_ref", "geometry": "gas",
-   "structure": "h2o.cif",           "stoich": {},
-   "gas_data": {
-     "molecule": "H2O",
-     "symmetry_number": 2,
-     "spin_multiplicity": 1,
-     "linear": false,
-     "mu_model": "janaf"
-   }},
-  {"label": "H2",         "role": "gas_ref", "geometry": "gas",
-   "structure": "h2.cif",            "stoich": {},
-   "gas_data": {"molecule": "H2", "mu_model": "janaf"}}
-]
-```
-
-**CLI:**
-```bash
-python phase_diagram_workflow.py \
-    --configs configs_H2O_Ru0001.json \
-    --pseudo-dir /pseudos \
-    --temperatures "200,300,400,500,600" \
-    --logp-species "H2O:-5:5,H2:-15:0" \
-    --prefix H2O_Ru0001
-```
-
-> **Negative stoich convention:** `"stoich": {"H2O": 1, "H2": -0.5}` means
-> this config is formed by adsorbing one H₂O molecule **and releasing** 0.5 H₂
-> back to the gas phase (i.e., dissociative adsorption leaving an OH).
-
----
-
-## 9. Chemical Potential Models
-
-### When to use each model
-
-| System | Recommended model | Reason |
-|---|---|---|
-| H/metal at T < 600 K | `janaf` | NIST-JANAF highly accurate; fast |
-| O/metal at any T | `janaf` or `ideal_gas` | Both reliable; `ideal_gas` avoids tabulated data |
-| CO/metal | `janaf` | Excellent CO data in JANAF |
-| H₂O/metal | `janaf` | Accurate experimental data available |
-| Novel/rare gas | `ideal_gas` or `phonopy` | No JANAF entry available |
-| High accuracy check | `ideal_gas` | Cross-validate against JANAF |
-| Tight-binding/cheap DFT | `phonopy` | Consistent level of theory throughout |
-
-### `stoich_factor` usage
-
-The `stoich_factor` scales the entire μ array after construction.
-Use it to define whether the stoich values in slab configs are
-counted in molecules or atoms:
-
-```
-# Per-atom convention (stoich_factor = 0.5 for H2):
-# stoich: {"H2": 2}  →  2 × (0.5 × μ_H2) = μ_H2  → adds 2 H atoms
-
-# Per-molecule convention (stoich_factor = 1.0 for H2):
-# stoich: {"H2": 1}  →  1 × μ_H2  → equivalent
-```
-
-Both give the same ΔG. Choose the convention that matches how you
-count adsorbates in your stoich dicts.
-
----
-
-## 10. Supported Gas Species (JANAF)
-
-The following species have built-in JANAF tables and ZPE corrections:
-
-| Molecule | σ | 2S+1 | Linear | ZPE (eV) | T range (K) |
-|---|---|---|---|---|---|
-| H₂ | 2 | 1 | Yes | 0.2567 | 0–1200 |
-| O₂ | 2 | 3 | Yes | 0.0974 | 0–1200 |
-| N₂ | 2 | 1 | Yes | 0.1449 | 0–1200 |
-| CO | 1 | 1 | Yes | 0.1323 | 0–1200 |
-| H₂O | 2 | 1 | No  | 0.5580 | 0–1200 |
-| NO | 1 | 2 | Yes | 0.1180 | 0–1200 |
-| NH₃ | 3 | 1 | No  | 0.9020 | 0–1000 |
-| CO₂ | 2 | 1 | Yes | 0.3050 | 0–1200 |
-
-For species not in this table, use `mu_model: "ideal_gas"` (requires phonopy run
-for frequencies) or `mu_model: "phonopy"` (uses harmonic F_vib directly).
-
----
-
-## 11. Normalisation Modes
-
-| Mode | Formula | Units | Typical use |
-|---|---|---|---|
-| `area` | `ΔG / A_cell` | eV/Å² | Surface slabs — compare coverage stability |
-| `formula_unit` | `ΔG / n_fu` | eV/f.u. | Bulk phases, oxides, nitrides |
-| `none` | `ΔG` (raw) | eV/cell | Post-processing; custom normalisation |
-| `auto` | `area` if slab, `formula_unit` if bulk | — | Default; safe choice |
-
-For `auto`, the geometry of the **clean** reference config determines the mode.
-
----
-
-## 12. Flyte Remote Execution
-
-```bash
-# Register the workflow
-pyflyte register phase_diagram_workflow.py
-
-# Run remotely
-pyflyte run --remote phase_diagram_workflow.py \
-    phase_diagram_workflow \
-    --configs_file s3://my-bucket/configs.json \
-    --qe_params.pseudo_dir /pseudos \
-    --qe_params.ecutwfc 80 \
-    --ph_params.supercell_matrix "3 3 1" \
-    --pd_params.temperatures_K "300,500,700,900" \
-    --pd_params.logP_min -20 \
-    --pd_params.logP_max 5
-```
-
-**Resource configuration** (edit at top of file):
-
-```python
-_RES_LIGHT  = Resources(cpu="1",  mem="4Gi",  gpu="0")   # prep, analysis tasks
-_RES_MEDIUM = Resources(cpu="4",  mem="8Gi",  gpu="0")   # phonopy assembly
-_RES_HEAVY  = Resources(cpu="16", mem="32Gi", gpu="0")   # pw.x relax, SCF
-```
-
-All displacement SCF calculations (`run_displacement_task`) run as a `map_task`
-and are fully parallelised across the Flyte cluster — one pod per displaced
-supercell.
-
----
-
-## 13. Known Limitations
-
-1. **Multi-reservoir 2D plotting**: the PNG phase diagram is always a 2D slice
-   (T vs first reservoir P). For two-reservoir systems, the second P axis is
-   evaluated at its midpoint. Full 3D or faceted plots require post-processing
-   the JSON output.
-
-2. **`bulk_ref` in ΔG**: bulk references are computed but not yet subtracted
-   from ΔG automatically. To model bulk phase competition you must manually
-   add a slab config whose stoich accounts for the bulk formation energy, or
-   post-process the JSON.
-
-3. **Imaginary modes**: the code drops any phonopy frequencies below 1 cm⁻¹
-   (numerical noise / rigid translation). If a slab has genuine soft modes
-   (instabilities), the resulting F_vib will be unphysical — check the
-   phonon DOS before interpreting results.
-
-4. **Ideal-gas for solids**: `mu_model: "ideal_gas"` is only physically
-   meaningful for gas-phase molecules. Do not set it for slab or bulk entries.
-
-5. **JANAF range**: the built-in JANAF tables extend to 1200 K for most species
-   and 1000 K for NH₃. Temperatures above these values will use the last
-   tabulated point (flat extrapolation), which may introduce errors.
+- **Supported metals**: Cu, Ni, Pd, Ag, Au, Al (FCC only; lattice parameters hardcoded).
+- **Supported gases**: H₂, O₂, N₂, CO (symmetry numbers and spin multiplicities hardcoded). Other molecules fall back to `σ=1, 2S+1=1`.
+- **Coverage range**: Always generates 0.25 ML steps at FCC hollow sites. Bridge/top/HCP sites are not currently explored.
+- **Pressure axis**: The `logP` fields in `PhaseDiagramParams` are reserved but not yet wired into the phase diagram assembly task.
+- **Plot output**: `plot_png` is always `None` in the current implementation; plotting is not yet implemented.
+- **Execution environment**: Requires a running Flyte cluster or `pyflyte` local sandbox. Cannot be run standalone without Flyte.
